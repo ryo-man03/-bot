@@ -1,4 +1,7 @@
 import os
+import socket
+from collections import deque
+
 import discord
 
 # ==================================================
@@ -20,6 +23,17 @@ SEND_ONLINE_COUNT_MESSAGE = True
 
 # 絵文字連投が長くなりすぎるのを防ぐ
 MAX_EMOJI_REPEAT = 50
+
+# 同じPCでBotを二重起動しないために使うローカルポート
+INSTANCE_LOCK_PORT = int(os.getenv("BOT_INSTANCE_LOCK_PORT", "38473"))
+
+# Discordから同じイベントが再送された場合に備えて、直近のメッセージIDを保持する
+PROCESSED_MESSAGE_LIMIT = 1000
+processed_message_ids: set[int] = set()
+processed_message_order: deque[int] = deque()
+
+# プロセス終了まで保持し、二重起動防止用のポートを開けたままにする
+instance_lock_socket: socket.socket | None = None
 
 
 # ==================================================
@@ -59,6 +73,47 @@ client = discord.Client(
 # ==================================================
 # 関数
 # ==================================================
+
+def acquire_single_instance_lock() -> None:
+    """同じPC上でBotが複数起動するのを防ぐ。"""
+    global instance_lock_socket
+
+    lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    # Windowsでは他プロセスによる同じポートの使用を明示的に拒否する
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        lock_socket.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_EXCLUSIVEADDRUSE,
+            1,
+        )
+
+    try:
+        lock_socket.bind(("127.0.0.1", INSTANCE_LOCK_PORT))
+        lock_socket.listen(1)
+    except OSError as error:
+        lock_socket.close()
+        raise RuntimeError(
+            "Botはすでに起動しています。"
+            "先に起動したBotを終了してから、もう一度実行してください。"
+        ) from error
+
+    instance_lock_socket = lock_socket
+
+
+def mark_message_processed(message_id: int) -> bool:
+    """未処理のメッセージIDなら記録してTrueを返す。"""
+    if message_id in processed_message_ids:
+        return False
+
+    processed_message_ids.add(message_id)
+    processed_message_order.append(message_id)
+
+    if len(processed_message_order) > PROCESSED_MESSAGE_LIMIT:
+        oldest_message_id = processed_message_order.popleft()
+        processed_message_ids.discard(oldest_message_id)
+
+    return True
 
 def count_online_humans_in_channel(message: discord.Message) -> int:
     """
@@ -172,6 +227,11 @@ async def on_message(message: discord.Message):
     if emoji_text is None:
         return
 
+    # 同一プロセス内で同じメッセージイベントを二重処理しない
+    if not mark_message_processed(message.id):
+        print(f"重複イベントを無視しました: message_id={message.id}")
+        return
+
     # 元の投稿へのリアクションは、オンライン人数に関係なく付ける
     reacted = await safe_add_reaction(message, emoji_text)
 
@@ -189,4 +249,6 @@ async def on_message(message: discord.Message):
     )
 
 
-client.run(TOKEN)
+if __name__ == "__main__":
+    acquire_single_instance_lock()
+    client.run(TOKEN)
